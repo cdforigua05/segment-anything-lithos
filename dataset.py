@@ -43,6 +43,7 @@ class LithosDataset(Dataset):
 
     def __len__(self):
         return len(self.df)
+        # return 20
 
     def __getitem__(self, idx) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # read dataframe row
@@ -84,9 +85,12 @@ class LithosDataset(Dataset):
             _, mask, bbox = self._preprocess(image, mask_data)
         else:
             image, mask, bbox = self._preprocess(image, mask_data)
-
+        #Point to prompt
+        central_point = torch.tensor([[512, 512]])
+        central_point_label = torch.tensor([1])
+        points = [central_point, central_point_label]
         # return self._preprocess(image_data, mask_data)
-        return image, mask, bbox
+        return image, mask, bbox, points
 
     def _preprocess(
         self, image: np.ndarray, mask: np.ndarray

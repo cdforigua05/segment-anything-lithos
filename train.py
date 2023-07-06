@@ -46,6 +46,7 @@ class TrainMedSam:
         checkpoint: str = "work_dir/SAM/sam_vit_b_01ec64.pth",
         num_pols: int = 20,
         multiple_pols: bool = False,
+        save_path: str = "No_name",
     ):
         self.lr = lr
         self.batch_size = batch_size
@@ -57,6 +58,7 @@ class TrainMedSam:
         self.model_type = model_type
         self.num_pols = num_pols
         self.multiple_pols = multiple_pols
+        self.save_path = os.path.join("runs", save_path)
 
     def __call__(self, train_df, val_df, image_col, mask_col):
         """Entry method
@@ -64,20 +66,20 @@ class TrainMedSam:
 
         """
         train_ds = LithosDataset(
-            train_df,
-            image_col,
-            mask_col,
-            self.image_dir,
-            self.mask_dir,
-            self.multiple_pols
+            df=train_df,
+            image_col=image_col,
+            mask_col=mask_col,
+            image_dir=self.image_dir,
+            mask_dir=self.mask_dir,
+            multiple_pols=self.multiple_pols,
         )
         val_ds = LithosDataset(
-            val_df,
-            image_col,
-            mask_col,
-            self.image_dir,
-            self.mask_dir,
-            self.multiple_pols
+            df=val_df,
+            image_col=image_col,
+            mask_col=mask_col,
+            image_dir=self.image_dir,
+            mask_dir=self.mask_dir,
+            multiple_pols=self.multiple_pols,
         )
 
         # Define dataloaders
@@ -174,14 +176,16 @@ class TrainMedSam:
         progress_bar = tqdm(val_loader, total=len(val_loader))
         val_loss = []
         val_dice = []
+        model.eval()
 
-        for image, mask, bbox in progress_bar:
+        for image, mask, bbox, im_point in progress_bar:
             image = image.to(self.device)
             mask = mask.to(self.device)
+            im_point = im_point.to(self.device)
             # resize image to 1024 by 1024
             #! MOVED RESIZE TO THE DATALOADER!
             # image = TF.resize(image, (1024, 1024), antialias=True)
-            # H, W = mask.shape[-2], mask.shape[-1]
+            H, W = mask.shape[-2], mask.shape[-1]
 
             # sam_trans = ResizeLongestSide(model.image_encoder.img_size)
 
@@ -191,15 +195,9 @@ class TrainMedSam:
             # Get predictioin mask
 
             image_embeddings = model.image_encoder(image)  # (B,256,64,64)
-            central_point = torch.tensor([[512, 512]]).to(self.device)
-            central_point = torch.unsqueeze(central_point, 0)
-            central_point_label = torch.tensor([1])
-            central_point_label = torch.unsqueeze(central_point_label, 0).to(
-                self.device
-            )
 
             sparse_embeddings, dense_embeddings = model.prompt_encoder(
-                points=torch.tensor([[512, 512]]).to(self.device),
+                points=im_point,
                 boxes=None,
                 masks=None,
             )
@@ -247,9 +245,11 @@ class TrainMedSam:
         val_loss = []
         dice_scores = []
 
-        for image, mask, bbox in progress_bar:
+        for image, mask, bbox, im_point in progress_bar:
             image = image.to(self.device)
             mask = mask.to(self.device)
+            im_point = im_point.to(self.device)
+
             # resize image to 1024 by 1024
             image = TF.resize(image, (1024, 1024), antialias=True)
             H, W = mask.shape[-2], mask.shape[-1]
@@ -260,15 +260,9 @@ class TrainMedSam:
             # Get predictioin mask
 
             image_embeddings = model.image_encoder(image)  # (B,256,64,64)
-            central_point = torch.tensor([[512, 512]]).to(self.device)
-            central_point = torch.unsqueeze(central_point, 0)
-            central_point_label = torch.tensor([1])
-            central_point_label = torch.unsqueeze(central_point_label, 0).to(
-                self.device
-            )
 
             sparse_embeddings, dense_embeddings = model.prompt_encoder(
-                points=torch.tensor([[512, 512]]).to(self.device),
+                points=im_point,
                 boxes=None,
                 masks=None,
             )
@@ -302,7 +296,7 @@ class TrainMedSam:
         """Train the model"""
 
         # sam_trans = ResizeLongestSide(model.image_encoder.img_size)
-        writer = SummaryWriter()
+        writer = SummaryWriter(log_dir=self.save_path)
 
         optimizer = optim.Adam(model.parameters(), lr=self.lr, weight_decay=0.001)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -316,9 +310,11 @@ class TrainMedSam:
             epoch_loss = []
             epoch_dice = []
             progress_bar = tqdm(train_loader, total=len(train_loader))
-            for image, mask, bbox in progress_bar:
+            for image, mask, bbox, im_point in progress_bar:
                 image = image.to(self.device)
                 mask = mask.to(self.device)
+                im_point[0] = im_point[0].to(self.device)
+                im_point[1] = im_point[1].to(self.device)
                 # resize image to 1024 by 1024
                 #! MOVED RESIZE TO THE DATALOADER!
                 # image = TF.resize(image, (1024, 1024), antialias=True)
@@ -329,16 +325,12 @@ class TrainMedSam:
 
                 # Get predictioin mask
                 with torch.enable_grad():
-                    image_embeddings = model.image_encoder(image)  # (B,256,64,64)
-                    central_point = torch.tensor([[512, 512]]).to(self.device)
-                    central_point = torch.unsqueeze(central_point, 0)
-                    central_point_label = torch.tensor([1])
-                    central_point_label = torch.unsqueeze(central_point_label, 0).to(
-                        self.device
-                    )
+                    image_embeddings = model.image_encoder(
+                        image
+                    )  # (B,256,64,64) -> (B,C,H,W)
 
                     sparse_embeddings, dense_embeddings = model.prompt_encoder(
-                        points=[central_point, central_point_label],
+                        points=im_point,
                         boxes=None,
                         masks=None,
                     )
@@ -402,14 +394,13 @@ class TrainMedSam:
 
     def save_model(self, model):
         date_postfix = datetime.now().strftime("%Y-%m-%d-%H-%S")
-        model_name = f"medsam_finetune_{date_postfix}.pth"
-        save_path = "finetune_weights"
+        model_name = f"lithossam_finetune_{date_postfix}.pth"
 
-        if not os.path.exists(save_path):
-            os.mkdir(save_path)
+        if not os.path.exists(self.save_path):
+            os.mkdir(self.save_path)
 
-        print(f"[INFO:] Saving model to {os.path.join(save_path,model_name)}")
-        torch.save(model.state_dict(), os.path.join(save_path, model_name))
+        print(f"[INFO:] Saving model to {os.path.join(self.save_path,model_name)}")
+        torch.save(model.state_dict(), os.path.join(self.save_path, model_name))
 
     def early_stopping(
         self,
@@ -503,7 +494,7 @@ def main():
         "--lr", type=float, required=False, default=3e-4, help="learning rate"
     )
     parser.add_argument(
-        "--batch_size", type=int, required=False, default=400, help="batch size"
+        "--batch_size", type=int, required=False, default=6, help="batch size"
     )
     parser.add_argument("--model_type", type=str, required=False, default="vit_b")
     parser.add_argument(
@@ -511,6 +502,9 @@ def main():
         type=str,
         default="/media/SSD6/pruiz/LITHOS/segment-anything-lithos/segment_anything/models/sam_vit_b_01ec64.pth",
         help="Path to SAM checkpoint",
+    )
+    parser.add_argument(
+        "--experiment_name", type=str, required=True, help="Folder to save experiment"
     )
 
     args = parser.parse_args()
@@ -541,6 +535,7 @@ def main():
         checkpoint=args.checkpoint,
         num_pols=args.num_pols,
         multiple_pols=args.multiple_pols,
+        save_path=args.experiment_name,
     )
 
     train(train_df, val_df, args.image_col, args.mask_col)

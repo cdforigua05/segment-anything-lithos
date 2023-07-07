@@ -379,7 +379,6 @@ class TrainMedSam:
                     image_embeddings = self.unwrap_model(model).image_encoder(
                         image
                     )  # (B,256,64,64) -> (B,C,H,W)
-                    breakpoint()
                     #! CUANDO PARALELIZO LLEGA SIN GRAD
                     if self.rank == 0:
                         print(image_embeddings)

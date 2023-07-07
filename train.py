@@ -14,9 +14,15 @@ from typing import Any, Iterable
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
+
 from segment_anything import sam_model_registry
 from segment_anything.utils.transforms import ResizeLongestSide
 from dataset import LithosDataset
+
+from args import ArgsInit
 
 
 def dice_score(preds, targets):
@@ -39,7 +45,7 @@ class TrainMedSam:
         lr: float = 3e-4,
         batch_size: int = 4,
         epochs: int = 100,
-        device: str = "cuda:0",
+        device: int = 0,
         model_type: str = "vit_b",
         image_dir="data/image_dir",
         mask_dir="data/image_dir",
@@ -47,11 +53,14 @@ class TrainMedSam:
         num_pols: int = 20,
         multiple_pols: bool = False,
         save_path: str = "No_name",
+        paralelized: bool = False,
+        world_size: int = 1,
     ):
         self.lr = lr
         self.batch_size = batch_size
         self.epochs = epochs
-        self.device = device
+        self.rank = device
+        self.device = torch.device("cuda:" + str(device))
         self.image_dir = image_dir
         self.mask_dir = mask_dir
         self.sam_checkpoint_dir = checkpoint
@@ -59,6 +68,8 @@ class TrainMedSam:
         self.num_pols = num_pols
         self.multiple_pols = multiple_pols
         self.save_path = os.path.join("runs", save_path)
+        self.paralelized = paralelized
+        self.world_size = world_size
 
     def __call__(self, train_df, val_df, image_col, mask_col):
         """Entry method
@@ -83,17 +94,38 @@ class TrainMedSam:
         )
 
         # Define dataloaders
-        train_loader = DataLoader(
-            dataset=train_ds, batch_size=self.batch_size, shuffle=True
-        )
-        val_loader = DataLoader(
-            dataset=val_ds, batch_size=self.batch_size, shuffle=False
-        )
+
+        if self.paralelized:
+            sampler_train = torch.utils.data.distributed.DistributedSampler(train_ds)
+            sampler_val = torch.utils.data.distributed.DistributedSampler(val_ds)
+            train_loader = DataLoader(
+                dataset=train_ds,
+                sampler=sampler_train,
+                batch_size=self.batch_size,
+            )
+            val_loader = DataLoader(
+                dataset=val_ds,
+                sampler=sampler_val,
+                batch_size=self.batch_size,
+            )
+
+        else:
+            train_loader = DataLoader(
+                dataset=train_ds, batch_size=self.batch_size, shuffle=True
+            )
+            val_loader = DataLoader(
+                dataset=val_ds, batch_size=self.batch_size, shuffle=False
+            )
 
         # get the model
         model = self.get_model()
+        model.to(self.device)
 
-        # TODO: FLAG PARA USAR O NO LAS POLARIZACIONES
+        if self.paralelized:
+            model = DDP(
+                model, device_ids=[self.device], find_unused_parameters=True
+            )
+
         if self.multiple_pols:
             #! Get parameters of the first layer of the patch_embed
             pe_kernel_size = model.image_encoder.patch_embed.proj.kernel_size
@@ -123,7 +155,11 @@ class TrainMedSam:
             )
             model.load_state_dict(new_model_state_dict)
 
-        model.to(self.device)
+        if self.paralelized:
+            dist.barrier()
+
+        
+
         #! Freeze everything but the first layer
         # pre_freeze = sum(p.numel() for p in model.parameters() if p.requires_grad)
         # print(f"After patch embed modified parameter: {pre_freeze}")
@@ -137,6 +173,8 @@ class TrainMedSam:
                 True if name in trainable_parameters_sam_lithos else False
             )
 
+        if self.paralelized:
+            dist.barrier()
         # pre_freeze = sum(p.numel() for p in model.parameters() if p.requires_grad)
         # print(f"After freezing parameter: {pre_freeze}")
 
@@ -157,6 +195,19 @@ class TrainMedSam:
         ).to(self.device)
 
         return sam_model
+
+    def unwrap_model(self, model: nn.Module) -> nn.Module:
+        """
+        Recursively unwraps a model from potential containers (as used in distributed training).
+
+        Args:
+            model (`torch.nn.Module`): The model to unwrap.
+        """
+        # since there could be multiple levels of wrapping, unwrap recursively
+        if hasattr(model, "module"):
+            return self.unwrap_model(model.module)
+        else:
+            return model
 
     @torch.inference_mode()
     def evaluate(self, model, val_loader, desc="Validating") -> float:
@@ -325,28 +376,39 @@ class TrainMedSam:
 
                 # Get predictioin mask
                 with torch.enable_grad():
-                    image_embeddings = model.image_encoder(
+                    image_embeddings = self.unwrap_model(model).image_encoder(
                         image
                     )  # (B,256,64,64) -> (B,C,H,W)
-
-                    sparse_embeddings, dense_embeddings = model.prompt_encoder(
+                    breakpoint()
+                    #! CUANDO PARALELIZO LLEGA SIN GRAD
+                    if self.rank == 0:
+                        print(image_embeddings)
+                    dist.barrier()
+                    sparse_embeddings, dense_embeddings = self.unwrap_model(
+                        model
+                    ).prompt_encoder(
                         points=im_point,
                         boxes=None,
                         masks=None,
                     )
 
-                    mask_predictions, _ = model.mask_decoder(
+                    mask_predictions, _ = self.unwrap_model(model).mask_decoder(
                         image_embeddings=image_embeddings.to(
                             self.device
                         ),  # (B, 256, 64, 64)
-                        image_pe=model.prompt_encoder.get_dense_pe(),  # (1, 256, 64, 64)
+                        image_pe=self.unwrap_model(
+                            model
+                        ).prompt_encoder.get_dense_pe(),  # (1, 256, 64, 64)
                         sparse_prompt_embeddings=sparse_embeddings,  # (B, 2, 256)
                         dense_prompt_embeddings=dense_embeddings,  # (B, 256, 64, 64)
                         multimask_output=False,
                     )
+
                 # Calculate loss
                 loss = seg_loss(mask_predictions, mask)
-
+                print(mask)
+                print(mask_predictions)
+                print(loss)
                 mask_predictions = (mask_predictions > 0.5).float()
                 dice = dice_score(mask_predictions, mask)
 
@@ -424,7 +486,10 @@ class TrainMedSam:
             )
             self.BEST_VAL_LOSS = val_loss
             self.BEST_EPOCH = epoch
-            self.save_model(model)
+            if self.rank == 0:
+                self.save_model(model)
+            if self.paralelized:
+                dist.barrier()
             return False
 
         if (
@@ -435,79 +500,9 @@ class TrainMedSam:
         return False
 
 
-def main():
-    # set up parser
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument("--fold", type=int, required=True, help="Cross validation fold")
-
-    parser.add_argument(
-        "--multiple_pols",
-        type=bool,
-        default=False,
-        help="Use multiple polarizations",
-    )
-
-    parser.add_argument(
-        "--num_pols",
-        type=int,
-        default=20,
-        help="Number of polarizations to use",
-    )
-
-    parser.add_argument(
-        "--csv",
-        type=str,
-        default="/media/SSD7/LITHOS/COCO_ANNOTATIONS",
-        help="Path to the CSV file",
-    )
-
-    parser.add_argument(
-        "--image_col",
-        type=str,
-        default="Sec_patch",
-        help="Name of the column on the dataframe that holds the image file names",
-    )
-
-    parser.add_argument(
-        "--mask_col",
-        type=str,
-        default="Sec_patch",
-        help="the name of the column on the dataframe that holds the mask file names",
-    )
-    parser.add_argument(
-        "--image",
-        type=str,
-        default="/media/SSD7/LITHOS/SEMANTIC_SEGMENTATION_DATASET",
-        help="Path to the input image directory",
-    )
-    parser.add_argument(
-        "--mask",
-        type=str,
-        default="/media/SSD7/LITHOS/SAM_ANNOTATIONS",
-        help="Path to the ground truth mask directory",
-    )
-    parser.add_argument(
-        "--num_epochs", type=int, required=False, default=1, help="number of epochs"
-    )
-    parser.add_argument(
-        "--lr", type=float, required=False, default=3e-4, help="learning rate"
-    )
-    parser.add_argument(
-        "--batch_size", type=int, required=False, default=6, help="batch size"
-    )
-    parser.add_argument("--model_type", type=str, required=False, default="vit_b")
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        default="/media/SSD6/pruiz/LITHOS/segment-anything-lithos/segment_anything/models/sam_vit_b_01ec64.pth",
-        help="Path to SAM checkpoint",
-    )
-    parser.add_argument(
-        "--experiment_name", type=str, required=True, help="Folder to save experiment"
-    )
-
-    args = parser.parse_args()
+def main(rank, args):
+    if args.paralelized:
+        setup(rank=rank, world_size=args.world_size)
 
     try:
         if args.fold == 1:
@@ -524,7 +519,11 @@ def main():
         name_file = os.path.join(args.csv, f"Fold{str(args.fold)}.csv")
         print(f"{name_file} does not exist")
 
-    print(f"[INFO] Starting training for {args.num_epochs} epochs ....")
+    if rank == 0:
+        print(f"[INFO] Starting training for {args.num_epochs} epochs ....")
+
+    if args.paralelized:
+        dist.barrier()
 
     train = TrainMedSam(
         lr=args.lr,
@@ -536,10 +535,28 @@ def main():
         num_pols=args.num_pols,
         multiple_pols=args.multiple_pols,
         save_path=args.experiment_name,
+        paralelized=args.paralelized,
+        world_size=args.world_size,
+        device=rank,
     )
 
     train(train_df, val_df, args.image_col, args.mask_col)
 
 
+def setup(rank=0, world_size=4):
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12355"
+
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+
+
+def run_process(args):
+    mp.spawn(main, args=([args]), nprocs=args.world_size, join=True)
+
+
 if __name__ == "__main__":
-    main()
+    args = ArgsInit().get_args()
+    if args.paralelized:
+        run_process(args)
+    else:
+        main(args.device, args)

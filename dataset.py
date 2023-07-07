@@ -137,7 +137,11 @@ class LithosDataset(Dataset):
             # read image and mask files
             im = cv2.imread(image_file)
             im = np.float32(im)
-            im = (im - im.min()) / (im.max() - im.min()) * 255.0
+            try:
+                im = (im - im.min()) / (im.max() - im.min()) * 255.0
+            except:
+                print(f'{image_file}')
+                continue
             im = TF.to_tensor(im)
             im = TF.resize(im, (1024, 1024), antialias=True)
             if not first:

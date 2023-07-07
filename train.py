@@ -383,7 +383,8 @@ class TrainMedSam:
                     #! CUANDO PARALELIZO LLEGA SIN GRAD
                     if self.rank == 0:
                         print(image_embeddings)
-                    dist.barrier()
+                    if self.paralelized:
+                        dist.barrier()
                     sparse_embeddings, dense_embeddings = self.unwrap_model(
                         model
                     ).prompt_encoder(

@@ -375,6 +375,7 @@ class TrainMedSam:
                 # box_tensor = torch.as_tensor(box, dtype=torch.float, device=self.device)
 
                 # Get predictioin mask
+                torch.autograd.set_grad_enabled(True)
                 with torch.enable_grad():
                     image_embeddings = self.unwrap_model(model).image_encoder(
                         image
